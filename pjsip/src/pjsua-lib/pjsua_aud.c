@@ -403,12 +403,14 @@ on_error:
     return status;
 }
 
-/* Ignore the last disconnected call still counted during media teardown.
- * Use the same check when scheduling and executing idle close.
+/* Include pending setup and ignore the last disconnected call still counted
+ * during media teardown. Use the same check when scheduling and executing
+ * idle close.
  */
 static pj_bool_t has_active_calls(void)
 {
     unsigned call_cnt = pjsua_call_get_count();
+    unsigned i;
 
     /* When this function is called from pjsua_media_channel_deinit() upon
      * disconnecting call, actually the call count hasn't been updated/
@@ -428,7 +430,25 @@ static pj_bool_t has_active_calls(void)
         }
     }
 
-    return call_cnt != 0;
+    if (call_cnt != 0)
+        return PJ_TRUE;
+
+    /* ICE/TURN setup can be pending before call_cnt is incremented.
+     * A pending dialog reserves its call slot, but a hangup no longer needs
+     * the sound device. Established calls were checked above.
+     */
+    for (i = 0; i < pjsua_var.ua_cfg.max_calls; ++i) {
+        const pjsua_call *call = &pjsua_var.calls[i];
+
+        if (call->async_call.dlg && !call->hanging_up &&
+            (!call->inv ||
+             call->inv->state != PJSIP_INV_STATE_DISCONNECTED))
+        {
+            return PJ_TRUE;
+        }
+    }
+
+    return PJ_FALSE;
 }
 
 /* Check if sound device is idle. */

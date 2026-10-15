@@ -66,6 +66,7 @@
 #include <pjsua-lib/pjsua_internal.h>
 #include <pjsip.h>
 #include <pjlib.h>
+#include <pjnath.h>
 
 #define THIS_FILE   "pjsua_call_test.c"
 
@@ -198,6 +199,7 @@ static struct
     pj_bool_t     incoming_seen;
     pj_bool_t     idle_sound_ringing;
     pj_atomic_t  *idle_sound_frames;
+    pj_sock_t     idle_sound_turn_sock;
     /* Incoming (callee) leg of the most recent self-call. */
     pjsua_call_id incoming_call_id;
     pj_bool_t     initial_app_managed_armed;
@@ -1680,6 +1682,162 @@ on_return:
     drain_all_calls();
     g_ctx.idle_sound_ringing = PJ_FALSE;
     pjsua_var.media_cfg.snd_auto_close_time = saved_delay;
+    return rc;
+}
+
+static pj_bool_t idle_sound_turn_has_request(pjsua_call_id call_id)
+{
+    pj_fd_set_t fds;
+    pj_time_val timeout = {0, 0};
+
+    PJ_UNUSED_ARG(call_id);
+    PJ_FD_ZERO(&fds);
+    PJ_FD_SET(g_ctx.idle_sound_turn_sock, &fds);
+    return pj_sock_select((int)g_ctx.idle_sound_turn_sock + 1, &fds,
+                           NULL, NULL, &timeout) > 0;
+}
+
+/* Fail the pending allocation to release candidate gathering. */
+static pj_status_t idle_sound_turn_fail(pj_pool_t *pool)
+{
+    pj_uint8_t packet[1024];
+    pj_ssize_t size = sizeof(packet);
+    pj_size_t encoded_size;
+    pj_sockaddr source;
+    int source_len = sizeof(source);
+    pj_stun_msg *request, *response;
+    pj_status_t status;
+
+    if (!wait_until(&idle_sound_turn_has_request, PJSUA_INVALID_ID,
+                    TEST_TIMEOUT_MSEC))
+        return PJ_ETIMEDOUT;
+    status = pj_sock_recvfrom(g_ctx.idle_sound_turn_sock, packet, &size, 0,
+                               &source, &source_len);
+    if (status != PJ_SUCCESS)
+        return status;
+    status = pj_stun_msg_decode(pool, packet, (pj_size_t)size,
+                                PJ_STUN_IS_DATAGRAM, &request, NULL, NULL);
+    if (status != PJ_SUCCESS)
+        return status;
+    if (request->hdr.type != PJ_STUN_ALLOCATE_REQUEST)
+        return PJ_EINVAL;
+    status = pj_stun_msg_create_response(pool, request, PJ_STUN_SC_BAD_REQUEST,
+                                         NULL, &response);
+    if (status != PJ_SUCCESS)
+        return status;
+    status = pj_stun_msg_encode(response, packet, sizeof(packet), 0, NULL,
+                                &encoded_size);
+    if (status != PJ_SUCCESS)
+        return status;
+    size = (pj_ssize_t)encoded_size;
+    return pj_sock_sendto(g_ctx.idle_sound_turn_sock, packet, &size, 0,
+                          &source, source_len);
+}
+
+static pj_bool_t idle_sound_call_is_gone(pjsua_call_id call_id)
+{
+    return !pjsua_var.calls[call_id].inv &&
+           !pjsua_var.calls[call_id].async_call.dlg;
+}
+
+/* A call waiting for ICE/TURN is not yet counted by pjsua_call_get_count().
+ * Let the idle timer expire during setup, then fail the allocation and check
+ * that sound closes after the call is cleaned up.
+ */
+static int test_idle_sound_async_setup(void)
+{
+    pj_pool_t *pool = pjsua_pool_create("idle-async-test", 4096, 4096);
+    int saved_delay = pjsua_var.media_cfg.snd_auto_close_time;
+    pjsua_acc_id acc_id = PJSUA_INVALID_ID;
+    pjsua_call_id caller = PJSUA_INVALID_ID;
+    pj_str_t loopback = pj_str("127.0.0.1");
+    pj_str_t uri = pj_str(g_ctx.self_uri);
+    pj_sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    char server[64];
+    pjsua_acc_config cfg;
+    pjsua_call_setting opt;
+    pj_status_t status;
+    int rc = -18012;
+
+    PJ_LOG(3, (THIS_FILE, "  idle sound during pending ICE/TURN setup"));
+    if (!pool)
+        return rc;
+    g_ctx.idle_sound_turn_sock = PJ_INVALID_SOCKET;
+    pjsua_var.media_cfg.snd_auto_close_time = 0;
+    if (pj_sock_socket(pj_AF_INET(), pj_SOCK_DGRAM(), 0,
+                       &g_ctx.idle_sound_turn_sock) != PJ_SUCCESS ||
+        pj_sockaddr_in_init(&addr, &loopback, 0) != PJ_SUCCESS ||
+        pj_sock_bind(g_ctx.idle_sound_turn_sock, &addr, sizeof(addr)) !=
+            PJ_SUCCESS ||
+        pj_sock_getsockname(g_ctx.idle_sound_turn_sock, &addr, &addr_len) !=
+            PJ_SUCCESS)
+    {
+        goto on_return;
+    }
+    pj_ansi_snprintf(server, sizeof(server), "127.0.0.1:%u",
+                      pj_ntohs(addr.sin_port));
+    pjsua_acc_config_default(&cfg);
+    cfg.id = pj_str("sip:idle-sound@example.invalid");
+    cfg.sip_stun_use = cfg.media_stun_use = PJSUA_STUN_USE_DISABLED;
+    cfg.ice_cfg_use = PJSUA_ICE_CONFIG_USE_CUSTOM;
+    cfg.ice_cfg.enable_ice = PJ_TRUE;
+    cfg.ice_cfg.ice_max_host_cands = 0;
+    cfg.ice_cfg.ice_no_rtcp = PJ_TRUE;
+    cfg.turn_cfg_use = PJSUA_TURN_CONFIG_USE_CUSTOM;
+    cfg.turn_cfg.enable_turn = PJ_TRUE;
+    cfg.turn_cfg.turn_server = pj_str(server);
+    cfg.turn_cfg.turn_conn_type = PJ_TURN_TP_UDP;
+    pjsua_call_setting_default(&opt);
+    opt.aud_cnt = 1;
+    opt.vid_cnt = opt.txt_cnt = 0;
+    if (pjsua_acc_add(&cfg, PJ_FALSE, &acc_id) != PJ_SUCCESS ||
+        pjsua_set_null_snd_dev() != PJ_SUCCESS ||
+        pjsua_call_make_call(acc_id, &uri, &opt, NULL, NULL, &caller) !=
+            PJ_SUCCESS)
+    {
+        goto on_return;
+    }
+    if (pjsua_call_get_count() != 0 ||
+        pjsua_var.calls[caller].inv ||
+        !pjsua_var.calls[caller].async_call.dlg)
+    {
+        goto on_return;
+    }
+    if (!wait_until(&idle_sound_timer_is_done, PJSUA_INVALID_ID,
+                    TEST_TIMEOUT_MSEC) || !pjsua_var.snd_is_on)
+    {
+        PJ_LOG(1, (THIS_FILE, "    sound closed during pending setup"));
+        rc = -18013;
+        goto on_return;
+    }
+
+    status = idle_sound_turn_fail(pool);
+    if (status != PJ_SUCCESS) {
+        PJ_PERROR(1, (THIS_FILE, status, "    local TURN reply failed"));
+        goto on_return;
+    }
+    if (!wait_until(&idle_sound_call_is_gone, caller, TEST_TIMEOUT_MSEC) ||
+        !wait_until(&idle_sound_is_closed, PJSUA_INVALID_ID,
+                    TEST_TIMEOUT_MSEC))
+    {
+        PJ_LOG(1, (THIS_FILE, "    async cleanup did not close idle sound"));
+        rc = -18014;
+        goto on_return;
+    }
+    rc = 0;
+
+on_return:
+    if (caller != PJSUA_INVALID_ID && !idle_sound_call_is_gone(caller))
+        pjsua_call_hangup(caller, 0, NULL, NULL);
+    drain_all_calls();
+    if (acc_id != PJSUA_INVALID_ID)
+        pjsua_acc_del(acc_id);
+    if (g_ctx.idle_sound_turn_sock != PJ_INVALID_SOCKET)
+        pj_sock_close(g_ctx.idle_sound_turn_sock);
+    g_ctx.idle_sound_turn_sock = PJ_INVALID_SOCKET;
+    pjsua_var.media_cfg.snd_auto_close_time = saved_delay;
+    pj_pool_release(pool);
     return rc;
 }
 
@@ -6413,6 +6571,9 @@ int pjsua_call_test(void)
     if (rc != 0) goto on_return;
 
     rc = test_idle_sound_call_setup();
+    if (rc != 0) goto on_return;
+
+    rc = test_idle_sound_async_setup();
     if (rc != 0) goto on_return;
 
     rc = test_make_call_bounds();
